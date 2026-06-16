@@ -216,3 +216,15 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Large data files
+data/tests_json/
+data/odis_json/
+data/state_vectors.parquet
+data/state_vectors_odi.parquet
+data/cricket.duckdb
+data/cricket_odi.duckdb
+data/*.csv
+data/*.txt
+!data/famous_matches/*.csv
+!data/famous_matches_odi/*.csv
