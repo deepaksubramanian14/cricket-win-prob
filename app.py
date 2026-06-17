@@ -15,6 +15,13 @@ import streamlit as st
 import xgboost as xgb
 import altair as alt
 
+from live_api import (
+    fetch_current_matches,
+    fetch_match_info,
+    api_to_test_state,
+    api_to_odi_state,
+)
+
 DATA_DIR = Path("data")
 
 # ----------------------------- Format configs -----------------------------
@@ -650,19 +657,105 @@ elif mode == "Manual entry":
         except (ValueError, KeyError) as e:
             st.error(f"Input problem: {e}")
 
-# ----------------------------- Live mode (placeholder) -----------------------------
+# ----------------------------- Live mode -----------------------------
 
 elif mode == "Live (API)":
     st.info(
-        f"Live mode for {format_choice} cricket. Connects to a cricket data API. "
+        f"Live mode for {format_choice} cricket. Connects to cricketdata.org. "
         "Get a free key at cricketdata.org, paste in sidebar."
     )
     api_key = st.sidebar.text_input("CricketData.org API key", type="password")
+
     if not api_key:
         st.warning("Enter an API key in the sidebar to enable live mode.")
     else:
-        st.info("Live mode wiring is the next step. For now use Manual or Replay mode.")
-        # TODO: fetch /currentMatches filtered by format
-        # TODO: fetch /match_info for selected
-        # TODO: map JSON to state dict (Test or ODI shape per format)
-        # TODO: predict + display with auto-refresh
+        col_a, col_b = st.columns([1, 3])
+        with col_a:
+            if st.button("Fetch live matches"):
+                try:
+                    with st.spinner("Fetching live matches..."):
+                        st.session_state.live_matches = fetch_current_matches(api_key)
+                except Exception as e:
+                    st.error(f"Fetch failed: {e}")
+
+        matches = st.session_state.get("live_matches", [])
+        fmt_key = "test" if is_test else "odi"
+        relevant = [m for m in matches if m.get("matchType") == fmt_key]
+
+        if matches and not relevant:
+            st.warning(f"No live {format_choice} matches right now.")
+            with st.expander(f"All {len(matches)} live matches"):
+                for m in matches:
+                    st.text(
+                        f"{m.get('matchType', '?'):5} | "
+                        f"{m.get('ms', '?'):8} | "
+                        f"{m.get('name', '')}"
+                    )
+
+        if relevant:
+            options = {
+                f"{m['name']} — {m.get('status', '')}": m["id"]
+                for m in relevant
+            }
+            pick = st.selectbox("Match", list(options.keys()))
+            match_id = options[pick]
+
+            if st.button("Get prediction", type="primary"):
+                try:
+                    with st.spinner("Fetching match state..."):
+                        resp = fetch_match_info(api_key, match_id)
+
+                    state = (
+                        api_to_test_state(resp) if is_test
+                        else api_to_odi_state(resp)
+                    )
+
+                    if state is None:
+                        st.warning(
+                            "Match has no score data yet (probably hasn't started)."
+                        )
+                    else:
+                        st.markdown(f"### {state['_match_name']}")
+                        cols = st.columns(2)
+                        cols[0].caption(f"📍 {state['_venue']}")
+                        cols[1].caption(f"📡 {state['_status']}")
+
+                        if is_test:
+                            features = compute_test_features(state, career)
+                            p_t1, p_t2, p_draw = predict_test(features, model)
+
+                            st.markdown("### Prediction")
+                            c1, c2, c3 = st.columns(3)
+                            c1.metric(state["team1"], f"{p_t1*100:.1f}%")
+                            c2.metric(state["team2"], f"{p_t2*100:.1f}%")
+                            c3.metric("Draw", f"{p_draw*100:.1f}%")
+                            st.progress(p_t1, text=f"{state['team1']}: {p_t1*100:.1f}%")
+                            st.progress(p_t2, text=f"{state['team2']}: {p_t2*100:.1f}%")
+                            st.progress(p_draw, text=f"Draw: {p_draw*100:.1f}%")
+                        else:
+                            features = compute_odi_features(state, career)
+                            p_t1, p_t2 = predict_odi(features, model)
+
+                            st.markdown("### Prediction")
+                            c1, c2 = st.columns(2)
+                            c1.metric(state["team1"], f"{p_t1*100:.1f}%")
+                            c2.metric(state["team2"], f"{p_t2*100:.1f}%")
+                            st.progress(p_t1, text=f"{state['team1']}: {p_t1*100:.1f}%")
+                            st.progress(p_t2, text=f"{state['team2']}: {p_t2*100:.1f}%")
+
+                        with st.expander("Parsed state (from API)"):
+                            st.json({k: v for k, v in state.items()
+                                     if not k.startswith("_")})
+                        with st.expander("Feature values fed to model"):
+                            st.json(features)
+                        with st.expander("Raw API response"):
+                            st.json(resp)
+
+                        st.caption(
+                            "Note: career stats, partnership runs, and recent-form "
+                            "metrics fall back to defaults (ball-by-ball API not yet wired). "
+                            "Headline features (innings, lead, balls remaining, target, RRR) "
+                            "are all from live data."
+                        )
+                except Exception as e:
+                    st.error(f"Failed: {e}")
