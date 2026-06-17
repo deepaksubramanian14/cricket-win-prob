@@ -9,6 +9,7 @@ Run locally:    streamlit run app.py
 Deploy:         push repo to GitHub, connect at share.streamlit.io
 """
 from __future__ import annotations
+from datetime import datetime
 from pathlib import Path
 import pandas as pd
 import streamlit as st
@@ -661,22 +662,19 @@ elif mode == "Manual entry":
 
 elif mode == "Live (API)":
     st.info(
-        f"Live mode for {format_choice} cricket. Connects to cricketdata.org. "
-        "Get a free key at cricketdata.org, paste in sidebar."
+        f"Live mode for {format_choice} cricket. Connects to cricketdata.org."
     )
     api_key = st.sidebar.text_input("CricketData.org API key", type="password")
 
     if not api_key:
         st.warning("Enter an API key in the sidebar to enable live mode.")
     else:
-        col_a, col_b = st.columns([1, 3])
-        with col_a:
-            if st.button("Fetch live matches"):
-                try:
-                    with st.spinner("Fetching live matches..."):
-                        st.session_state.live_matches = fetch_current_matches(api_key)
-                except Exception as e:
-                    st.error(f"Fetch failed: {e}")
+        if st.button("Fetch live matches"):
+            try:
+                with st.spinner("Fetching live matches..."):
+                    st.session_state.live_matches = fetch_current_matches(api_key)
+            except Exception as e:
+                st.error(f"Fetch failed: {e}")
 
         matches = st.session_state.get("live_matches", [])
         fmt_key = "test" if is_test else "odi"
@@ -700,11 +698,55 @@ elif mode == "Live (API)":
             pick = st.selectbox("Match", list(options.keys()))
             match_id = options[pick]
 
-            if st.button("Get prediction", type="primary"):
-                try:
-                    with st.spinner("Fetching match state..."):
-                        resp = fetch_match_info(api_key, match_id)
+            # Tracking controls
+            ctrl1, ctrl2, ctrl3 = st.columns([1, 1, 2])
+            with ctrl1:
+                tracking = st.toggle(
+                    "Auto-track",
+                    value=st.session_state.get(f"tracking_{match_id}", False),
+                    key=f"tracking_{match_id}",
+                    help="Auto-refresh and append a snapshot every N seconds.",
+                )
+            with ctrl2:
+                interval = st.selectbox(
+                    "Refresh (sec)",
+                    [30, 60, 120, 300],
+                    index=0,
+                    disabled=not tracking,
+                )
+            with ctrl3:
+                snapshot_now = st.button(
+                    "Snapshot now", help="Manually pull a single prediction."
+                )
 
+            # Auto-refresh if tracking is on. Falls back to a meta-refresh tag
+            # since streamlit-autorefresh isn't a default dep.
+            if tracking:
+                # Lightweight: just rerun on a timer using st.empty + sleep
+                # would block. Better: use HTML meta-refresh as a fallback.
+                # If you want a smoother experience, add streamlit-autorefresh.
+                try:
+                    from streamlit_autorefresh import st_autorefresh
+                    st_autorefresh(
+                        interval=interval * 1000,
+                        key=f"refresh_{match_id}",
+                    )
+                except ImportError:
+                    st.caption(
+                        f"Auto-refreshing every {interval}s. "
+                        f"(For smoother refresh, `pip install streamlit-autorefresh`.)"
+                    )
+                    st.markdown(
+                        f"<meta http-equiv='refresh' content='{interval}'>",
+                        unsafe_allow_html=True,
+                    )
+
+            # Pull + predict if tracking is on OR snapshot button pressed
+            should_poll = tracking or snapshot_now
+
+            if should_poll:
+                try:
+                    resp = fetch_match_info(api_key, match_id)
                     state = (
                         api_to_test_state(resp) if is_test
                         else api_to_odi_state(resp)
@@ -715,34 +757,112 @@ elif mode == "Live (API)":
                             "Match has no score data yet (probably hasn't started)."
                         )
                     else:
+                        # Header
                         st.markdown(f"### {state['_match_name']}")
-                        cols = st.columns(2)
-                        cols[0].caption(f"📍 {state['_venue']}")
-                        cols[1].caption(f"📡 {state['_status']}")
+                        hcol1, hcol2 = st.columns(2)
+                        hcol1.caption(f"📍 {state['_venue']}")
+                        hcol2.caption(f"📡 {state['_status']}")
 
+                        # Predict
                         if is_test:
                             features = compute_test_features(state, career)
                             p_t1, p_t2, p_draw = predict_test(features, model)
+                        else:
+                            features = compute_odi_features(state, career)
+                            p_t1, p_t2 = predict_odi(features, model)
+                            p_draw = 0.0
 
-                            st.markdown("### Prediction")
+                        # Current prediction
+                        st.markdown("### Current prediction")
+                        if is_test:
                             c1, c2, c3 = st.columns(3)
                             c1.metric(state["team1"], f"{p_t1*100:.1f}%")
                             c2.metric(state["team2"], f"{p_t2*100:.1f}%")
                             c3.metric("Draw", f"{p_draw*100:.1f}%")
-                            st.progress(p_t1, text=f"{state['team1']}: {p_t1*100:.1f}%")
-                            st.progress(p_t2, text=f"{state['team2']}: {p_t2*100:.1f}%")
-                            st.progress(p_draw, text=f"Draw: {p_draw*100:.1f}%")
                         else:
-                            features = compute_odi_features(state, career)
-                            p_t1, p_t2 = predict_odi(features, model)
-
-                            st.markdown("### Prediction")
                             c1, c2 = st.columns(2)
                             c1.metric(state["team1"], f"{p_t1*100:.1f}%")
                             c2.metric(state["team2"], f"{p_t2*100:.1f}%")
-                            st.progress(p_t1, text=f"{state['team1']}: {p_t1*100:.1f}%")
-                            st.progress(p_t2, text=f"{state['team2']}: {p_t2*100:.1f}%")
 
+                        # Append to history (dedupe by ball_in_match)
+                        if "live_history" not in st.session_state:
+                            st.session_state.live_history = {}
+                        history = st.session_state.live_history.setdefault(
+                            match_id, []
+                        )
+                        snap = {
+                            "ts": datetime.now().isoformat(timespec="seconds"),
+                            "ball_in_match": int(features["ball_in_match"]),
+                            "innings_num": int(features["innings_num"]),
+                            "batting_team": state["batting_team"],
+                            "p_team1": p_t1,
+                            "p_team2": p_t2,
+                            "p_draw": p_draw,
+                        }
+                        # Only append if ball advanced, or it's the first
+                        if not history or history[-1]["ball_in_match"] != snap["ball_in_match"]:
+                            history.append(snap)
+                        else:
+                            # Same ball — overwrite the last snapshot
+                            # (probabilities can still wobble if API state changed)
+                            history[-1] = snap
+
+                        # Live curve
+                        if len(history) >= 2:
+                            st.markdown("### Live curve")
+                            hist_df = pd.DataFrame(history)
+
+                            value_cols = ["p_team1", "p_team2"]
+                            team_map = {
+                                "p_team1": state["team1"],
+                                "p_team2": state["team2"],
+                            }
+                            if is_test:
+                                value_cols.append("p_draw")
+                                team_map["p_draw"] = "Draw"
+
+                            plot_df = hist_df[["ball_in_match"] + value_cols].melt(
+                                id_vars=["ball_in_match"],
+                                value_vars=value_cols,
+                                var_name="team",
+                                value_name="prob",
+                            )
+                            plot_df["team"] = plot_df["team"].map(team_map)
+
+                            chart = (
+                                alt.Chart(plot_df)
+                                .mark_line(strokeWidth=2, point=alt.OverlayMarkDef(size=30))
+                                .encode(
+                                    x=alt.X("ball_in_match:Q", title="Ball in match"),
+                                    y=alt.Y(
+                                        "prob:Q",
+                                        title="Win probability",
+                                        scale=alt.Scale(domain=[0, 1]),
+                                    ),
+                                    color=alt.Color("team:N", title="Outcome"),
+                                )
+                                .properties(height=400)
+                            )
+                            st.altair_chart(chart, use_container_width=True)
+                            st.caption(
+                                f"{len(history)} snapshots collected this session. "
+                                f"History is per-match and survives until you reload the tab."
+                            )
+                        else:
+                            st.caption(
+                                "First snapshot recorded. Curve appears after the second."
+                            )
+
+                        # Controls
+                        clear_col, _ = st.columns([1, 4])
+                        if clear_col.button(
+                            "Clear history for this match",
+                            type="secondary",
+                        ):
+                            st.session_state.live_history[match_id] = []
+                            st.rerun()
+
+                        # Diagnostics
                         with st.expander("Parsed state (from API)"):
                             st.json({k: v for k, v in state.items()
                                      if not k.startswith("_")})
@@ -752,10 +872,26 @@ elif mode == "Live (API)":
                             st.json(resp)
 
                         st.caption(
-                            "Note: career stats, partnership runs, and recent-form "
-                            "metrics fall back to defaults (ball-by-ball API not yet wired). "
-                            "Headline features (innings, lead, balls remaining, target, RRR) "
-                            "are all from live data."
+                            "Partnership runs and recent-form features fall back to "
+                            "defaults (no BBB data wired). Headline features "
+                            "(innings, lead, balls remaining, target, RRR) are live."
                         )
                 except Exception as e:
                     st.error(f"Failed: {e}")
+            else:
+                # Not polling — show last history if any
+                history = st.session_state.get("live_history", {}).get(match_id, [])
+                if history:
+                    last = history[-1]
+                    st.info(
+                        f"Tracking paused. Last snapshot at ball "
+                        f"{last['ball_in_match']} "
+                        f"({last['p_team1']*100:.1f}% / {last['p_team2']*100:.1f}%"
+                        + (f" / {last['p_draw']*100:.1f}% draw" if is_test else "")
+                        + "). Toggle Auto-track or click Snapshot now to continue."
+                    )
+                else:
+                    st.info(
+                        "Toggle **Auto-track** to start a live curve, or click "
+                        "**Snapshot now** for a one-off prediction."
+                    )
